@@ -30,6 +30,7 @@ set (FASTER_HEADERS
   core/utility.h
   device/file_system_disk.h
   device/null_disk.h
+  device/local_memory_disk.h
   environment/file.h
   environment/file_common.h
 )
