@@ -171,6 +171,10 @@ class FasterKv {
       overflow_buckets_allocator_[resize_info_.version]);
   }
 
+  int upsertSize(){
+    return num_upsert;
+  }
+
  private:
   typedef Record<key_t, value_t> record_t;
 
@@ -290,6 +294,8 @@ class FasterKv {
  public:
   disk_t disk;
   hlog_t hlog;
+  int num_upsert = 0;
+  int max_num_upsert = 47535430000;
 
  private:
   static constexpr bool kCopyReadsToTail = false;
@@ -363,6 +369,7 @@ inline void FasterKv<K, V, D>::Refresh() {
   if(thread_ctx().phase == Phase::REST && new_state.phase == Phase::REST) {
     return;
   }
+  printf("Refresh: handle special phases\n");
   HandleSpecialPhases();
 }
 
@@ -596,16 +603,24 @@ inline Status FasterKv<K, V, D>::Upsert(UC& context, AsyncCallback callback,
                 "alignof(value_t) != alignof(typename upsert_context_t::value_t)");
 
   pending_upsert_context_t pending_context{ context, callback };
+  if (num_upsert > max_num_upsert ){
+    printf("before internalupsert, num_upsert is %d\n", num_upsert);
+  }
   OperationStatus internal_status = InternalUpsert(pending_context);
   Status status;
+  num_upsert += 1;
 
   if(internal_status == OperationStatus::SUCCESS) {
     status = Status::Ok;
   } else {
     bool async;
+    printf("handle operation Status\n");
     status = HandleOperationStatus(thread_ctx(), pending_context, internal_status, async);
   }
   thread_ctx().serial_num = monotonic_serial_num;
+  if (num_upsert > max_num_upsert ){
+    printf("return status, num_upsert is %d\n", num_upsert);
+  }
   return status;
 }
 
@@ -672,7 +687,6 @@ inline bool FasterKv<K, V, D>::CompletePending(bool wait) {
     CompleteRetryRequests(thread_ctx());
 
     done = (thread_ctx().pending_ios.empty() && thread_ctx().retry_requests.empty());
-
     if(thread_ctx().phase != Phase::REST) {
       CompleteIoPendingRequests(prev_thread_ctx());
       Refresh();
@@ -694,13 +708,20 @@ inline void FasterKv<K, V, D>::CompleteIoPendingRequests(ExecutionContext& conte
   while(context.io_responses.try_pop(ctxt)) {
     CallbackContext<AsyncIOContext> io_context{ ctxt };
     CallbackContext<pending_context_t> pending_context{ io_context->caller_context };
-    // This I/O is no longer pending, since we popped its response off the queue.
+    // This I/O is no longer pending, since we popped its response off the
+    // queue.
     auto pending_io = context.pending_ios.find(io_context->io_id);
+    // printf("CompleteIoPendingRequests step1.2, id: %d\n", io_context->io_id);
     assert(pending_io != context.pending_ios.end());
-    context.pending_ios.erase(pending_io);
+    if (pending_io != context.pending_ios.end())
+    {context.pending_ios.erase(pending_io);}
+    else {
+      printf("cannot erase\n");
+    }
 
     // Issue the continue command
     OperationStatus internal_status;
+    
     if(pending_context->type == OperationType::Read) {
       internal_status = InternalContinuePendingRead(context, *io_context.get());
     } else {
@@ -841,12 +862,14 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
   typedef C pending_upsert_context_t;
 
   if(thread_ctx().phase != Phase::REST) {
+    printf("heavyenter\n");
     HeavyEnter();
   }
 
   KeyHash hash = pending_context.get_key_hash();
   HashBucketEntry expected_entry;
   AtomicHashBucketEntry* atomic_entry = FindOrCreateEntry(hash, expected_entry);
+  
 
   // (Note that address will be Address::kInvalidAddress, if the atomic_entry was created.)
   Address address = expected_entry.address();
@@ -863,6 +886,9 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
       address = TraceBackForKeyMatchCtxt(pending_context, record->header.previous_address(), head_address);
     }
   }
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 1, num_upsert is %d\n", num_upsert);
+  }
 
   CheckpointLockGuard lock_guard{ checkpoint_locks_, hash };
 
@@ -876,6 +902,9 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
       goto create_record;
     }
   }
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 2, num_upsert is %d\n", num_upsert);
+  }
 
   // Acquire necessary locks.
   switch(thread_ctx().phase) {
@@ -888,6 +917,7 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
       if(latest_record_version > thread_ctx().version) {
         // CPR shift detected: we are in the "PREPARE" phase, and a record has a version later than
         // what we've seen.
+        printf("go_async 1\n");
         pending_context.go_async(thread_ctx().phase, thread_ctx().version, address,
                                  expected_entry);
         return OperationStatus::CPR_SHIFT_DETECTED;
@@ -899,6 +929,7 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
     if(latest_record_version < thread_ctx().version) {
       // Will create new record or update existing record to new version (v+1).
       if(!lock_guard.try_lock_new()) {
+        printf("go_async 2\n");
         pending_context.go_async(thread_ctx().phase, thread_ctx().version, address,
                                  expected_entry);
         return OperationStatus::RETRY_LATER;
@@ -912,6 +943,7 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
     // All other threads are in phase {IN_PROGRESS,WAIT_PENDING,WAIT_FLUSH}.
     if(latest_record_version < thread_ctx().version) {
       if(lock_guard.old_locked()) {
+        printf("go_async 3\n");
         pending_context.go_async(thread_ctx().phase, thread_ctx().version, address,
                                  expected_entry);
         return OperationStatus::RETRY_LATER;
@@ -929,6 +961,9 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
     break;
   default:
     break;
+  }
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 3, num_upsert is %d\n", num_upsert);
   }
 
   if(address >= read_only_address) {
@@ -950,24 +985,51 @@ inline OperationStatus FasterKv<K, V, D>::InternalUpsert(C& pending_context) {
 
   // Create a record and attempt RCU.
 create_record:
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 4, num_upsert is %d\n", num_upsert);
+  }
+  
   uint32_t record_size = record_t::size(pending_context.key_size(), pending_context.value_size());
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 4.11, num_upsert is %d\n", num_upsert);
+  }
   Address new_address = BlockAllocate(record_size);
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 4.12, num_upsert is %d\n", num_upsert);
+  }
   record_t* record = reinterpret_cast<record_t*>(hlog.Get(new_address));
   new(record) record_t{
     RecordInfo{
       static_cast<uint16_t>(thread_ctx().version), true, false, false,
       expected_entry.address() }
   };
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 4.1, num_upsert is %d\n", num_upsert);
+  }
   pending_context.write_deep_key_at(const_cast<key_t*>(&record->key()));
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 4.2, num_upsert is %d\n", num_upsert);
+  }
   pending_context.Put(record);
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 4.3, num_upsert is %d\n", num_upsert);
+  }
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 5, num_upsert is %d\n", num_upsert);
+  }
 
   HashBucketEntry updated_entry{ new_address, hash.tag(), false };
-
+  if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 6, num_upsert is %d\n", num_upsert);
+  }
   if(atomic_entry->compare_exchange_strong(expected_entry, updated_entry)) {
     // Installed the new record in the hash table.
     return OperationStatus::SUCCESS;
   } else {
     // Try again.
+    if (num_upsert > max_num_upsert ){
+    printf("internalupsert step 7, num_upsert is %d\n", num_upsert);
+  }
     record->header.invalid = true;
     return InternalUpsert(pending_context);
   }
@@ -1464,6 +1526,7 @@ inline Status FasterKv<K, V, D>::IssueAsyncIoRequest(ExecutionContext& ctx,
     pending_context_t& pending_context, bool& async) {
   // Issue asynchronous I/O request
   uint64_t io_id = thread_ctx().io_id++;
+  // printf("IssueAsyncIoRequest: id : %d\n", io_id);
   thread_ctx().pending_ios.insert({ io_id, pending_context.get_key_hash() });
   async = true;
   AsyncIOContext io_request{ this, pending_context.address, &pending_context,

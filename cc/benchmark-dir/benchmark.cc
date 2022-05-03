@@ -14,6 +14,7 @@
 #include "core/auto_ptr.h"
 #include "core/faster.h"
 #include "device/null_disk.h"
+#include "device/local_memory_disk.h"
 
 using namespace std::chrono_literals;
 using namespace FASTER::core;
@@ -29,12 +30,13 @@ enum class Op : uint8_t {
 };
 
 enum class Workload {
-  A_50_50 = 0,
-  RMW_100 = 1,
+  R_100 = 0,
+  A_50_50 = 1,
+  RMW_100 = 2,
 };
 
 static constexpr uint64_t kInitCount = 250000000;
-static constexpr uint64_t kTxnCount = 1000000000;
+static constexpr uint64_t kTxnCount = 1000000000 ;
 static constexpr uint64_t kChunkSize = 3200;
 static constexpr uint64_t kRefreshInterval = 64;
 static constexpr uint64_t kCompletePendingInterval = 1600;
@@ -255,7 +257,8 @@ typedef FASTER::environment::ThreadPoolIoHandler handler_t;
 #else
 typedef FASTER::environment::QueueIoHandler handler_t;
 #endif
-typedef FASTER::device::FileSystemDisk<handler_t, 1073741824ull> disk_t;
+// typedef FASTER::device::FileSystemDisk<handler_t, 17179869184ull> disk_t;
+typedef FASTER::device::LocalMemoryDisk<1073741824ull, 17179869184ull, 1> disk_t;
 using store_t = FasterKv<Key, Value, disk_t>;
 
 inline Op ycsb_a_50_50(std::mt19937& rng) {
@@ -264,6 +267,10 @@ inline Op ycsb_a_50_50(std::mt19937& rng) {
   } else {
     return Op::Upsert;
   }
+}
+
+inline Op ycsb_read_100(std::mt19937& rng) {
+  return Op::Read;
 }
 
 inline Op ycsb_rmw_100(std::mt19937& rng) {
@@ -409,16 +416,23 @@ void thread_setup_store(store_t* store, size_t thread_idx) {
   uint64_t value = 42;
   for(uint64_t chunk_idx = idx_.fetch_add(kChunkSize); chunk_idx < kInitCount;
       chunk_idx = idx_.fetch_add(kChunkSize)) {
+        //printf("chunk_idx: %d\n", chunk_idx);
     for(uint64_t idx = chunk_idx; idx < chunk_idx + kChunkSize; ++idx) {
       if(idx % kRefreshInterval == 0) {
         store->Refresh();
-        if(idx % kCompletePendingInterval == 0) {
+        if(idx % kCompletePendingInterval == 0) {  
           store->CompletePending(false);
         }
       }
 
       UpsertContext context{ init_keys_.get()[idx], value };
+      /*if (chunk_idx >= 47535000){
+          printf("store upsert, upsertNum: %d\n", store->upsertSize());
+        }*/
       store->Upsert(context, callback, 1);
+      /*if (chunk_idx >= 47535000){
+          printf("after store upsert, upsertNum: %d\n", store->upsertSize());
+        }*/
     }
   }
 
@@ -438,7 +452,7 @@ void setup_store(store_t* store, size_t num_threads) {
 
   init_keys_.reset();
 
-  printf("Finished populating store: contains ?? elements.\n");
+  printf("Finished populating store: contains %lu elements.\n", store->Size());
 }
 
 
@@ -470,20 +484,26 @@ void thread_run_benchmark(store_t* store, size_t thread_idx) {
     }
     for(uint64_t idx = chunk_idx; idx < chunk_idx + kChunkSize; ++idx) {
       if(idx % kRefreshInterval == 0) {
+        //printf("op: refresh\n");
         store->Refresh();
+        //printf("after op: refresh\n");
         if(idx % kCompletePendingInterval == 0) {
+          // printf("op: CompletePending\n");
           store->CompletePending(false);
+          // printf("after op: CompletePending\n");
         }
       }
       switch(FN(rng)) {
       case Op::Insert:
       case Op::Upsert: {
+        
         auto callback = [](IAsyncContext* ctxt, Status result) {
           CallbackContext<UpsertContext> context{ ctxt };
         };
-
+        //printf("op: upsert\n");
         UpsertContext context{ txn_keys_.get()[idx], upsert_value };
         Status result = store->Upsert(context, callback, 1);
+        //printf("after op: upsert\n");
         ++writes_done;
         break;
       }
@@ -492,23 +512,27 @@ void thread_run_benchmark(store_t* store, size_t thread_idx) {
         exit(1);
         break;
       case Op::Read: {
+        
         auto callback = [](IAsyncContext* ctxt, Status result) {
           CallbackContext<ReadContext> context{ ctxt };
         };
-
+        //printf("op: read\n");
         ReadContext context{ txn_keys_.get()[idx] };
 
         Status result = store->Read(context, callback, 1);
+        //printf("after op: read\n");
         ++reads_done;
         break;
       }
       case Op::ReadModifyWrite:
+      
         auto callback = [](IAsyncContext* ctxt, Status result) {
           CallbackContext<RmwContext> context{ ctxt };
         };
-
+        //printf("op: RMW\n");
         RmwContext context{ txn_keys_.get()[idx], 5 };
         Status result = store->Rmw(context, callback, 1);
+        //printf("after op: RMW\n");
         if(result == Status::Ok) {
           ++writes_done;
         }
@@ -594,7 +618,9 @@ void run_benchmark(store_t* store, size_t num_threads) {
 void run(Workload workload, size_t num_threads) {
   // FASTER store has a hash table with approx. kInitCount / 2 entries and a log of size 16 GB
   size_t init_size = next_power_of_two(kInitCount / 2);
-  store_t store{ init_size, 17179869184, "storage" };
+  //store_t store{ init_size, 17179869184, "storage" };
+  store_t store{ init_size, 1073741824, "storage" };
+  
 
   printf("Populating the store...\n");
 
@@ -604,6 +630,9 @@ void run(Workload workload, size_t num_threads) {
 
   printf("Running benchmark on %" PRIu64 " threads...\n", num_threads);
   switch(workload) {
+  case Workload::R_100:
+    run_benchmark<ycsb_read_100>(&store, num_threads);
+    break;
   case Workload::A_50_50:
     run_benchmark<ycsb_a_50_50>(&store, num_threads);
     break;
@@ -629,6 +658,7 @@ int main(int argc, char* argv[]) {
   std::string run_filename{ argv[4] };
 
   load_files(load_filename, run_filename);
+  
 
   run(workload, num_threads);
 

@@ -237,6 +237,8 @@ class PersistentMemoryMalloc {
   typedef typename D::log_file_t log_file_t;
   typedef PersistentMemoryMalloc<disk_t> alloc_t;
 
+  int num_shift = 0;
+
   /// Each page in the buffer is 2^25 bytes (= 32 MB).
   static constexpr uint64_t kPageSize = Address::kMaxOffset + 1;
 
@@ -662,7 +664,6 @@ inline void PersistentMemoryMalloc<D>::AsyncGetFromDisk(Address address, uint32_
   context.record.valid_offset = offset;
   context.record.available_bytes = length - offset;
   context.record.required_bytes = num_records;
-
   file->ReadAsync(begin_read, context.record.buffer(), length, callback, context);
 }
 
@@ -724,6 +725,7 @@ void PersistentMemoryMalloc<D>::OnPagesMarkedReadOnly(IAsyncContext* ctxt) {
   if(context->allocator->MonotonicUpdate(context->allocator->safe_read_only_address,
                                          context->new_safe_read_only_address,
                                          old_safe_read_only_address)) {
+    
     context->allocator->AsyncFlushPages(old_safe_read_only_address.page(),
                                         context->new_safe_read_only_address);
   }
@@ -754,6 +756,7 @@ Status PersistentMemoryMalloc<D>::AsyncFlushPages(uint32_t start_page, Address u
     uint32_t page;
     Address until_address;
   };
+
 
   auto callback = [](IAsyncContext* ctxt, Status result, size_t bytes_transferred) {
     CallbackContext<Context> context{ ctxt };
@@ -798,7 +801,6 @@ Status PersistentMemoryMalloc<D>::AsyncFlushPages(uint32_t start_page, Address u
       new_status = FlushCloseStatus{ FlushStatus::InProgress, old_status.close };
     } while(!PageStatus(flush_page).status.compare_exchange_weak(old_status, new_status));
     PageStatus(flush_page).LastFlushedUntilAddress.store(0);
-
     RETURN_NOT_OK(file->WriteAsync(Page(flush_page), kPageSize * flush_page, kPageSize, callback,
                                    context));
   }
@@ -999,13 +1001,14 @@ inline void PersistentMemoryMalloc<D>::PageAlignedShiftHeadAddress(uint32_t tail
     // Desired head address is <= 0.
     return;
   }
+  
 
   Address desired_head_address{ tail_page - (buffer_size_ - kNumHeadPages), 0 };
 
   if(current_flushed_until_address < desired_head_address) {
     desired_head_address = Address{ current_flushed_until_address.page(), 0 };
   }
-
+  
   Address old_head_address;
   if(MonotonicUpdate(head_address, desired_head_address, old_head_address)) {
     OnPagesClosed_Context context{ this, desired_head_address, false };
@@ -1023,10 +1026,13 @@ inline void PersistentMemoryMalloc<D>::PageAlignedShiftReadOnlyAddress(uint32_t 
     // Desired read-only address is <= 0.
     return;
   }
+  num_shift += 1;
 
+  
   Address desired_read_only_address{ tail_page - num_mutable_pages_, 0 };
   Address old_read_only_address;
-  if(MonotonicUpdate(read_only_address, desired_read_only_address, old_read_only_address)) {
+  
+  if(MonotonicUpdate(read_only_address, desired_read_only_address, old_read_only_address)) {    
     OnPagesMarkedReadOnly_Context context{ this, desired_read_only_address, false };
     IAsyncContext* context_copy;
     Status result = context.DeepCopy(context_copy);

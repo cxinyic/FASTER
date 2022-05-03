@@ -32,12 +32,12 @@ class Address {
   static constexpr uint64_t kAddressBits = 48;
   static constexpr uint64_t kMaxAddress = ((uint64_t)1 << kAddressBits) - 1;
   /// --of which 25 bits are used for offsets into a page, of size 2^25 = 32 MB.
-  static constexpr uint64_t kOffsetBits = 25;
+  static constexpr uint64_t kOffsetBits = 12;
   static constexpr uint32_t kMaxOffset = ((uint32_t)1 << kOffsetBits) - 1;
   /// --and the remaining 23 bits are used for the page index, allowing for approximately 8 million
   /// pages.
   static constexpr uint64_t kPageBits = kAddressBits - kOffsetBits;
-  static constexpr uint32_t kMaxPage = ((uint32_t)1 << kPageBits) - 1;
+  static constexpr uint64_t kMaxPage = ((uint64_t)1 << kPageBits) - 1;
 
   /// Default constructor.
   Address()
